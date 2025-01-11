@@ -1,0 +1,111 @@
+//made by Zifor , special thanks to MikeMorenoDSP for debug. 
+
+#include <Bela.h>
+#include <libraries/Midi/Midi.h>
+#include <libraries/Gui/Gui.h>
+#include <libraries/GuiController/GuiController.h>
+#include <stdlib.h>
+#include <cmath>
+#include <vector>
+
+constexpr int NUM_BANDS = 16;
+constexpr float MAX_GAIN = 127.0f; // Maximum MIDI value range
+constexpr float MIN_GAIN = 0.0f;   // Minimum MIDI value range
+constexpr float NOISE_THRESHOLD = 0.05f; // Threshold for noise filtering
+constexpr float Q = 0.01f;  // Kalman process noise covariance
+constexpr float R = 0.1f;   // Kalman measurement noise covariance
+
+std::vector<float> bandGains(NUM_BANDS, 63.5f); // Initialize at midpoint
+std::vector<float> kalmanEstimates(NUM_BANDS, 63.5f);
+std::vector<float> kalmanErrors(NUM_BANDS, 1.0f); // Kalman error estimates
+
+Gui gui;
+GuiController controller;
+std::vector<unsigned int> sliderIndices(NUM_BANDS);
+std::vector<bool> midiActive(NUM_BANDS, false); // Track MIDI activity
+
+Midi midi;
+
+const char* gMidiPort0 = "hw:1,0,0";
+
+// Manual clamp function
+float clampValue(float value, float minVal, float maxVal) {
+    if (value < minVal) return minVal;
+    if (value > maxVal) return maxVal;
+    return value;
+}
+
+// Kalman filter function
+float applyKalmanFilter(float measurement, int bandIndex) {
+    float& estimate = kalmanEstimates[bandIndex];
+    float& error = kalmanErrors[bandIndex];
+
+    // Update step
+    float kalmanGain = error / (error + R);
+    estimate = estimate + kalmanGain * (measurement - estimate);
+    error = (1 - kalmanGain) * error;
+
+    // Predict step
+    error += Q;
+
+    return estimate;
+}
+
+// MIDI callback
+void midiMessageCallback(MidiChannelMessage message, void* arg) {
+    if (message.getType() == kmmControlChange) {
+        int channel = message.getChannel();  // MIDI channel (0-15 for channels 1-16)
+        int cc = message.getDataByte(0);     // CC number
+        int value = message.getDataByte(1);  // CC value (0-127)
+
+        // Log raw MIDI input
+        rt_printf("Raw MIDI Input - Channel: %d, CC: %d, Value: %d\n", channel, cc, value);
+
+        // Ensure value is within the valid MIDI range
+        value = clampValue(value, MIN_GAIN, MAX_GAIN);
+
+        if (channel < NUM_BANDS) {
+            int bandIndex = channel;
+
+            // Apply Kalman filter
+            float filteredValue = applyKalmanFilter(value, bandIndex);
+
+            // Update gain directly
+            bandGains[bandIndex] = filteredValue;
+
+            // Update GUI
+            if (!midiActive[bandIndex] || std::fabs(controller.getSliderValue(sliderIndices[bandIndex]) - filteredValue) > 1.0f) {
+                midiActive[bandIndex] = true;
+                controller.setSliderValue(sliderIndices[bandIndex], filteredValue);
+            }
+
+            rt_printf("Channel %d, CC %d, Band %d Gain set to %f (Filtered)\n",
+                      channel + 1, cc, bandIndex + 1, bandGains[bandIndex]);
+        }
+    }
+}
+
+bool setup(BelaContext *context, void *userData) {
+    gui.setup(context->projectName);
+    controller.setup(&gui, "Filter Bank Controls");
+
+    for (int i = 0; i < NUM_BANDS; ++i) {
+        sliderIndices[i] = controller.addSlider("Band " + std::to_string(i + 1),
+                                                bandGains[i], MIN_GAIN, MAX_GAIN, 1.0);
+    }
+
+    // Initialize MIDI
+    midi.readFrom(gMidiPort0);
+    midi.writeTo(gMidiPort0);
+    midi.enableParser(true);
+    midi.getParser()->setCallback(midiMessageCallback, (void*)gMidiPort0);
+    rt_printf("MIDI device initialized.\n");
+
+    return true;
+}
+
+void render(BelaContext *context, void *userData) {
+    // MIDI handling only, audio processing removed for focus
+}
+
+void cleanup(BelaContext *context, void *userData) {}
